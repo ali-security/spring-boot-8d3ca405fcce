@@ -1,5 +1,5 @@
 /*
- * Copyright 2012-2019 the original author or authors.
+ * Copyright 2012-2020 the original author or authors.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -20,9 +20,16 @@ import java.io.File;
 import java.net.MalformedURLException;
 import java.net.URL;
 import java.net.URLDecoder;
+import java.nio.file.FileSystems;
+import java.nio.file.Files;
+import java.nio.file.LinkOption;
+import java.nio.file.Path;
+import java.nio.file.attribute.PosixFilePermission;
+import java.util.EnumSet;
 
 import javax.servlet.ServletContext;
 
+import org.junit.Assume;
 import org.junit.Test;
 import org.junit.runner.RunWith;
 
@@ -87,6 +94,26 @@ public class SpringBootMockServletContextTests implements ServletContextAware {
 		String[] contents = file.list((dir, name) -> !(".".equals(name) || "..".equals(name)));
 		assertThat(contents).isNotEqualTo(nullValue());
 		assertThat(contents.length).isEqualTo(0);
+	}
+
+	@Test
+	public void getRootUrlIsOnlyAccessibleByOwner() throws Exception {
+		Assume.assumeTrue("POSIX file attributes not supported",
+				FileSystems.getDefault().supportedFileAttributeViews().contains("posix"));
+		SpringBootMockServletContext context = new SpringBootMockServletContext("src/test/doesntexist") {
+			@Override
+			protected String getResourceLocation(String path) {
+				// Don't include the Spring Boot defaults for this test
+				return getResourceBasePathLocation(path);
+			}
+		};
+		URL resource = context.getResource("/");
+		assertThat(resource).isNotNull();
+		Path path = new File(URLDecoder.decode(resource.getPath(), "UTF-8")).toPath();
+		assertThat(Files.isSymbolicLink(path)).isFalse();
+		assertThat(Files.getPosixFilePermissions(path, LinkOption.NOFOLLOW_LINKS)).isEqualTo(EnumSet
+				.of(PosixFilePermission.OWNER_READ, PosixFilePermission.OWNER_WRITE, PosixFilePermission.OWNER_EXECUTE));
+		assertThat(context.getResource("/")).isEqualTo(resource);
 	}
 
 	@Configuration
