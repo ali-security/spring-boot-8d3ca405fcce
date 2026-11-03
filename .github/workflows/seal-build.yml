@@ -1,0 +1,136 @@
+# Sealed build of spring-boot (core module) for the ali-security fork.
+# Upstream Spring Boot 2.1.x has no GitHub Actions CI (it builds on Concourse via
+# ci/scripts/build-project.sh: `mvn -N clean verify` then
+# `mvn -f spring-boot-project/pom.xml clean deploy -Dfull`). This workflow mirrors
+# that on JDK 8 (java.version=1.8 in spring-boot-parent) with Maven 3.9.5.
+name: seal-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Optional surefire -Dtest selector; empty runs the full suite"
+        required: false
+        default: ""
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 48
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: spring-boot
+            modules: spring-boot-project/spring-boot
+            artifact: true
+          - name: spring-boot-test+actuator-autoconfigure
+            modules: spring-boot-project/spring-boot-test,spring-boot-project/spring-boot-actuator-autoconfigure
+            artifact: false
+    env:
+      MAVEN_OPTS: -Xmx3g
+      MVN_ARGS: -B -V -Ddisable.checks=true -Dscan=false
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "8"
+
+      - name: Install Maven 3.9.5
+        run: |
+          curl -fsSL https://archive.apache.org/dist/maven/maven-3/3.9.5/binaries/apache-maven-3.9.5-bin.tar.gz -o /tmp/maven.tgz
+          tar -xzf /tmp/maven.tgz -C /opt
+          echo "/opt/apache-maven-3.9.5/bin" >> "$GITHUB_PATH"
+
+      - name: Configure Maven (Central mirror; repo.spring.io now requires auth)
+        run: |
+          mkdir -p ~/.m2
+          cat > ~/.m2/settings.xml <<'EOF'
+          <settings>
+            <mirrors>
+              <mirror>
+                <id>central-mirror</id>
+                <mirrorOf>*</mirrorOf>
+                <url>https://repo.maven.apache.org/maven2</url>
+              </mirror>
+            </mirrors>
+          </settings>
+          EOF
+          # Gradle Enterprise build-scan extensions are build infra, not part of the build
+          rm -f .mvn/extensions.xml
+
+      - name: Install root and build modules (tests run in the next step)
+        run: |
+          mvn $MVN_ARGS -N install -DskipTests
+          mvn $MVN_ARGS -f spring-boot-project/pom.xml install -DskipTests \
+            -pl "$(echo '${{ matrix.modules }}' | sed 's#spring-boot-project/##g')" -am
+
+      - name: Collect artifact
+        if: matrix.artifact
+        run: |
+          mkdir -p dist
+          cp spring-boot-project/spring-boot/target/spring-boot-2.1.18.RELEASE.jar dist/
+          ls -l dist
+
+      - name: Test
+        env:
+          TEST_FILTER: ${{ inputs.test-filter }}
+        run: |
+          MODS="$(echo '${{ matrix.modules }}' | sed 's#spring-boot-project/##g')"
+          if [ -n "$TEST_FILTER" ]; then
+            mvn $MVN_ARGS -f spring-boot-project/pom.xml verify -pl "$MODS" \
+              -Dtest="${TEST_FILTER// /,}" -DfailIfNoTests=false
+          else
+            mvn $MVN_ARGS -f spring-boot-project/pom.xml verify -pl "$MODS"
+          fi
+
+      - name: Test summary (surefire reports)
+        if: always()
+        run: |
+          python3 - '${{ matrix.modules }}' <<'PY'
+          import glob, sys, xml.etree.ElementTree as ET
+          # Source-level reasons for assumption-based skips whose runtime message is generic
+          KNOWN = {
+              ("UndertowServletWebServerFactoryTests", "jspServletInitParameters"):
+                  "Assume getJspServlet()!=null: UndertowServletWebServerFactoryTests.getJspServlet() returns null - Undertow does not support JSPs",
+              ("UndertowServletWebServerFactoryTests", "jspServletIsNotInDevelopmentModeByDefault"):
+                  "Assume getJspServlet()!=null: UndertowServletWebServerFactoryTests.getJspServlet() returns null - Undertow does not support JSPs",
+              ("SpringBootContextLoaderTests", "environmentPropertiesNewLineInValue"):
+                  "bare @Ignore shipped by upstream at the v2.1.18.RELEASE tag (source comment: gh-4384, unresolved upstream issue - a newline inside an inlined test property value is not supported)",
+          }
+          gt = gf = ge = gs = 0
+          for mod in sys.argv[1].split(","):
+              t = f = e = s = 0
+              skipped = []
+              for path in sorted(glob.glob(f"{mod}/target/surefire-reports/TEST-*.xml")):
+                  root = ET.parse(path).getroot()
+                  for tc in root.iter("testcase"):
+                      t += 1
+                      if tc.find("failure") is not None: f += 1
+                      if tc.find("error") is not None: e += 1
+                      sk = tc.find("skipped")
+                      if sk is not None:
+                          s += 1
+                          cls = tc.get("classname", "")
+                          name = tc.get("name", "")
+                          msg = (sk.get("message") or "").strip() or "@Ignore (no message)"
+                          extra = KNOWN.get((cls.rsplit(".", 1)[-1], name))
+                          if extra:
+                              msg = f"{msg} [{extra}]"
+                          skipped.append(f"  SKIPPED {cls}.{name}: {msg}")
+              print(f"== {mod}: tests={t} passed={t-f-e-s} failures={f} errors={e} skipped={s}")
+              for line in skipped:
+                  print(line)
+              gt += t; gf += f; ge += e; gs += s
+          print(f"== TOTAL: tests={gt} passed={gt-gf-ge-gs} failures={gf} errors={ge} skipped={gs}")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        if: matrix.artifact
+        with:
+          name: spring-boot-jar
+          path: dist/spring-boot-2.1.18.RELEASE.jar
+          if-no-files-found: error
