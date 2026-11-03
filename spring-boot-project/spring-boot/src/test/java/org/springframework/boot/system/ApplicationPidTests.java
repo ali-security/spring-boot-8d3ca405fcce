@@ -18,7 +18,13 @@ package org.springframework.boot.system;
 
 import java.io.File;
 import java.io.FileReader;
+import java.io.IOException;
+import java.nio.file.FileSystems;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 
+import org.junit.Assume;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
@@ -26,7 +32,9 @@ import org.junit.rules.TemporaryFolder;
 import org.springframework.util.FileCopyUtils;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatIOException;
 import static org.assertj.core.api.Assertions.assertThatIllegalStateException;
+import static org.assertj.core.api.Assertions.contentOf;
 
 /**
  * Tests for {@link ApplicationPid}.
@@ -76,8 +84,71 @@ public class ApplicationPidTests {
 	}
 
 	@Test
+	public void overwriteExistingPid() throws Exception {
+		File file = new File(this.temporaryFolder.getRoot(), "pid");
+		new ApplicationPid("123").write(file);
+		assertThat(contentOf(file)).isEqualTo("123");
+		new ApplicationPid("456").write(file);
+		assertThat(contentOf(file)).isEqualTo("456");
+	}
+
+	@Test
+	public void overwriteLongerExistingPid() throws Exception {
+		File file = new File(this.temporaryFolder.getRoot(), "pid");
+		new ApplicationPid("123456").write(file);
+		new ApplicationPid("789").write(file);
+		assertThat(contentOf(file)).isEqualTo("789");
+	}
+
+	@Test
+	public void writePidCreatesParentDirectories() throws Exception {
+		File file = new File(this.temporaryFolder.getRoot(), "a/b/pid");
+		new ApplicationPid("123").write(file);
+		assertThat(contentOf(file)).isEqualTo("123");
+	}
+
+	@Test
+	public void whenSymlinkToNonExistentTargetExistsAtPidFileLocationWriteThrows() throws IOException {
+		assumePosix();
+		File link = new File(this.temporaryFolder.getRoot(), "pid");
+		File target = new File(this.temporaryFolder.getRoot(), "target");
+		createSymbolicLink(link.toPath(), target.toPath());
+		ApplicationPid pid = new ApplicationPid("123");
+		assertThatIOException().isThrownBy(() -> pid.write(link));
+		assertThat(Files.isSymbolicLink(link.toPath())).isTrue();
+		assertThat(target).doesNotExist();
+	}
+
+	@Test
+	public void whenSymlinkToTargetExistsAtPidFileLocationWriteThrows() throws IOException {
+		assumePosix();
+		File link = new File(this.temporaryFolder.getRoot(), "pid");
+		Path target = new File(this.temporaryFolder.getRoot(), "target").toPath();
+		Files.write(target, "target".getBytes(), StandardOpenOption.CREATE_NEW);
+		createSymbolicLink(link.toPath(), target);
+		ApplicationPid pid = new ApplicationPid("123");
+		assertThatIOException().isThrownBy(() -> pid.write(link));
+		assertThat(Files.isSymbolicLink(link.toPath())).isTrue();
+		assertThat(contentOf(target.toFile())).isEqualTo("target");
+	}
+
+	@Test
 	public void getPidFromJvm() {
 		assertThat(new ApplicationPid().toString()).isNotEmpty();
+	}
+
+	private void createSymbolicLink(Path link, Path target) {
+		try {
+			Files.createSymbolicLink(link, target);
+		}
+		catch (Exception ex) {
+			Assume.assumeNoException("Symlink creation not supported", ex);
+		}
+	}
+
+	private void assumePosix() {
+		Assume.assumeTrue("POSIX file attributes not supported",
+				FileSystems.getDefault().supportedFileAttributeViews().contains("posix"));
 	}
 
 }

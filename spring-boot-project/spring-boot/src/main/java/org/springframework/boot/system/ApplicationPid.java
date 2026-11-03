@@ -18,10 +18,13 @@ package org.springframework.boot.system;
 
 import java.io.File;
 import java.io.FileNotFoundException;
-import java.io.FileWriter;
 import java.io.IOException;
 import java.lang.management.ManagementFactory;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.nio.file.LinkOption;
+import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.nio.file.attribute.PosixFilePermission;
 import java.util.Set;
 
@@ -88,31 +91,33 @@ public class ApplicationPid {
 	 */
 	public void write(File file) throws IOException {
 		Assert.state(this.pid != null, "No PID available");
-		createParentFolder(file);
-		if (file.exists()) {
-			assertCanOverwrite(file);
+		Path path = file.toPath();
+		createParentFolder(path);
+		if (Files.exists(path, LinkOption.NOFOLLOW_LINKS)) {
+			assertCanOverwrite(path);
 		}
-		try (FileWriter writer = new FileWriter(file)) {
-			writer.append(this.pid);
+		Files.write(path, this.pid.getBytes(StandardCharsets.UTF_8), StandardOpenOption.TRUNCATE_EXISTING,
+				StandardOpenOption.CREATE, LinkOption.NOFOLLOW_LINKS);
+	}
+
+	private void createParentFolder(Path path) throws IOException {
+		Path parent = path.getParent();
+		// Java 8's Files.createDirectories rejects an existing parent that is a symlink
+		// to a directory (e.g. /var/run -> /run), so only create missing parents
+		if (parent != null && !Files.isDirectory(parent)) {
+			Files.createDirectories(parent);
 		}
 	}
 
-	private void createParentFolder(File file) {
-		File parent = file.getParentFile();
-		if (parent != null) {
-			parent.mkdirs();
-		}
-	}
-
-	private void assertCanOverwrite(File file) throws IOException {
-		if (!file.canWrite() || !canWritePosixFile(file)) {
+	private void assertCanOverwrite(Path file) throws IOException {
+		if (!Files.isWritable(file) || !canWritePosixFile(file)) {
 			throw new FileNotFoundException(file.toString() + " (permission denied)");
 		}
 	}
 
-	private boolean canWritePosixFile(File file) throws IOException {
+	private boolean canWritePosixFile(Path file) throws IOException {
 		try {
-			Set<PosixFilePermission> permissions = Files.getPosixFilePermissions(file.toPath());
+			Set<PosixFilePermission> permissions = Files.getPosixFilePermissions(file, LinkOption.NOFOLLOW_LINKS);
 			for (PosixFilePermission permission : WRITE_PERMISSIONS) {
 				if (permissions.contains(permission)) {
 					return true;

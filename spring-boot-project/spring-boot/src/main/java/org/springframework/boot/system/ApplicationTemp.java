@@ -17,7 +17,20 @@
 package org.springframework.boot.system;
 
 import java.io.File;
+import java.io.IOException;
+import java.io.UncheckedIOException;
+import java.nio.file.FileSystem;
+import java.nio.file.Files;
+import java.nio.file.LinkOption;
+import java.nio.file.Path;
+import java.nio.file.attribute.FileAttribute;
+import java.nio.file.attribute.PosixFileAttributeView;
+import java.nio.file.attribute.PosixFileAttributes;
+import java.nio.file.attribute.PosixFilePermission;
+import java.nio.file.attribute.PosixFilePermissions;
+import java.nio.file.attribute.UserPrincipal;
 import java.security.MessageDigest;
+import java.util.EnumSet;
 
 import org.springframework.util.Assert;
 import org.springframework.util.StringUtils;
@@ -34,9 +47,16 @@ public class ApplicationTemp {
 
 	private static final char[] HEX_CHARS = "0123456789ABCDEF".toCharArray();
 
+	private static final FileAttribute<?>[] NO_FILE_ATTRIBUTES = {};
+
+	private static final EnumSet<PosixFilePermission> DIRECTORY_PERMISSIONS = EnumSet.of(PosixFilePermission.OWNER_READ,
+			PosixFilePermission.OWNER_WRITE, PosixFilePermission.OWNER_EXECUTE);
+
 	private final Class<?> sourceClass;
 
-	private volatile File dir;
+	private final UserPrincipal directoryOwner;
+
+	private volatile Path path;
 
 	/**
 	 * Create a new {@link ApplicationTemp} instance.
@@ -51,6 +71,22 @@ public class ApplicationTemp {
 	 */
 	public ApplicationTemp(Class<?> sourceClass) {
 		this.sourceClass = sourceClass;
+		this.directoryOwner = directoryOwner();
+	}
+
+	private static UserPrincipal directoryOwner() {
+		try {
+			Path tempFile = Files.createTempFile("application-temp", "-owner");
+			UserPrincipal owner = Files.getOwner(tempFile);
+			Files.delete(tempFile);
+			return owner;
+		}
+		catch (UnsupportedOperationException ex) {
+			return null;
+		}
+		catch (IOException ex) {
+			throw new UncheckedIOException(ex);
+		}
 	}
 
 	@Override
@@ -64,9 +100,12 @@ public class ApplicationTemp {
 	 * @return a sub-directory
 	 */
 	public File getDir(String subDir) {
-		File dir = new File(getDir(), subDir);
-		dir.mkdirs();
-		return dir;
+		Path dir = getPath();
+		// Create (or verify) each element so that nested sub-directories keep working
+		for (Path element : dir.getFileSystem().getPath(subDir)) {
+			dir = createDirectory(dir.resolve(element));
+		}
+		return dir.toFile();
 	}
 
 	/**
@@ -74,15 +113,74 @@ public class ApplicationTemp {
 	 * @return the application temp directory
 	 */
 	public File getDir() {
-		if (this.dir == null) {
+		return getPath().toFile();
+	}
+
+	private Path getPath() {
+		if (this.path == null) {
 			synchronized (this) {
-				byte[] hash = generateHash(this.sourceClass);
-				this.dir = new File(getTempDirectory(), toHexString(hash));
-				this.dir.mkdirs();
-				Assert.state(this.dir.exists(), () -> "Unable to create temp directory " + this.dir);
+				if (this.path == null) {
+					String hash = toHexString(generateHash(this.sourceClass));
+					this.path = createDirectory(getTempDirectory().toPath().resolve(hash));
+				}
 			}
 		}
-		return this.dir;
+		return this.path;
+	}
+
+	private Path createDirectory(Path path) {
+		try {
+			FileSystem fileSystem = path.getFileSystem();
+			if (!Files.exists(path, LinkOption.NOFOLLOW_LINKS)) {
+				Files.createDirectory(path, asFileAttributes(fileSystem, DIRECTORY_PERMISSIONS));
+			}
+			else {
+				if (supportsPosixView(fileSystem)) {
+					PosixFileAttributeView view = Files.getFileAttributeView(path, PosixFileAttributeView.class,
+							LinkOption.NOFOLLOW_LINKS);
+					PosixFileAttributes attributes = view.readAttributes();
+					Assert.state(attributes.isDirectory(),
+							() -> "'" + path + "' already exists but it is not a directory");
+					assertDirectoryOwnership(attributes.owner(), path);
+					if (!DIRECTORY_PERMISSIONS.equals(attributes.permissions())) {
+						// Directories created by earlier versions (using mkdirs) have
+						// umask-derived permissions. Restrict them now that we know that
+						// the directory is not a symlink and that we own it.
+						view.setPermissions(DIRECTORY_PERMISSIONS);
+					}
+				}
+				else {
+					Assert.state(Files.isDirectory(path, LinkOption.NOFOLLOW_LINKS),
+							() -> "'" + path + "' already exists but it is not a directory");
+					try {
+						assertDirectoryOwnership(Files.getOwner(path, LinkOption.NOFOLLOW_LINKS), path);
+					}
+					catch (UnsupportedOperationException ex) {
+						// Ownership check not supported. Continue.
+					}
+				}
+			}
+			return path;
+		}
+		catch (IOException ex) {
+			throw new IllegalStateException("Unable to create application temp directory " + path, ex);
+		}
+	}
+
+	private void assertDirectoryOwnership(UserPrincipal owner, Path path) {
+		Assert.state((this.directoryOwner == null) || this.directoryOwner.equals(owner),
+				() -> "Existing directory '" + path + "' is not owned by " + this.directoryOwner.getName());
+	}
+
+	private FileAttribute<?>[] asFileAttributes(FileSystem fileSystem, EnumSet<PosixFilePermission> ownerReadWrite) {
+		if (!supportsPosixView(fileSystem)) {
+			return NO_FILE_ATTRIBUTES;
+		}
+		return new FileAttribute<?>[] { PosixFilePermissions.asFileAttribute(ownerReadWrite) };
+	}
+
+	private boolean supportsPosixView(FileSystem fileSystem) {
+		return fileSystem.supportedFileAttributeViews().contains("posix");
 	}
 
 	private File getTempDirectory() {
